@@ -1,0 +1,151 @@
+<beans
+        xmlns="http://www.springframework.org/schema/beans"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns:context="http://www.springframework.org/schema/context"
+        xsi:schemaLocation="http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd
+            http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+            http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context.xsd">
+
+  <context:property-placeholder location="file:${activemq.conf}/camel.properties"/>
+
+  <camelContext xmlns="http://camel.apache.org/schema/spring">
+    <propertyPlaceholder id="properties" location="file:${activemq.conf}/camel.properties"/>
+
+    <onException>
+        <exception>java.io.IOException</exception>
+        <!-- 1 week with 5 seconds delay -->
+        <redeliveryPolicy maximumRedeliveries="120960" redeliveryDelay="5000" retryAttemptedLogLevel="INFO"/>
+    </onException>
+
+    <route id="multicast-route" startupOrder="1000">
+      <description>Multicaster</description>
+
+      <from uri="embedded-connection:queue:incoming.queue?concurrentConsumers=5&amp;asyncConsumer=true"/>
+
+      <!-- Activity Correlation ID -->
+      <doTry>
+        <setHeader headerName="ObjectId">
+          <jsonpath>$.id</jsonpath>
+        </setHeader>
+        <doCatch>
+          <exception>org.apache.camel.ExpressionEvaluationException</exception>
+        </doCatch>
+      </doTry>
+
+      <!-- Set MessageType header as value from "program", "ping2" otherwise -->
+      <doTry>
+        <setHeader headerName="MessageType">
+          <jsonpath>$.socialNetwork</jsonpath>
+        </setHeader>
+        <doCatch>
+          <exception>org.apache.camel.ExpressionEvaluationException</exception>
+          <setHeader headerName="MessageType">
+            <simple>NOSOCIALNETWORK</simple>
+          </setHeader>
+        </doCatch>
+      </doTry>
+
+      <!-- Set City header for easier filtering -->
+      <doTry>
+        <setHeader headerName="City">
+          <jsonpath>$.city</jsonpath>
+        </setHeader>
+        <doCatch>
+          <exception>org.apache.camel.ExpressionEvaluationException</exception>
+          <doTry>
+            <setHeader headerName="City">
+              <jsonpath>$.placesIveBeen[0].city</jsonpath>
+            </setHeader>
+            <doCatch>
+              <exception>org.apache.camel.ExpressionEvaluationException</exception>
+            </doCatch>
+          </doTry>
+        </doCatch>
+      </doTry>
+
+      <multicast>
+        <!-- Send all NOSOCIALNETWORK messages to 1 queue -->
+        <filter>
+          <mvel>
+            <![CDATA[
+             (
+               request.headers.MessageType == 'NOSOCIALNETWORK'
+             )
+             ]]>
+          </mvel>
+          <to uri="{{msg.endpoint.prefix}}:no.social.network?timeToLive={{msg.ttl}}"/>
+        </filter>
+
+        <!-- Send all other messages to another queue -->
+        <filter>
+          <mvel>
+            <![CDATA[
+             (
+               request.headers.MessageType != 'NOSOCIALNETWORK'
+             )
+             ]]>
+          </mvel>
+          <to uri="{{msg.endpoint.prefix}}:with-social-network?timeToLive={{msg.ttl}}"/>
+          <to uri="{{msg.endpoint.prefix}}:second-step-filtering.withSocialNetwork?timeToLive={{msg.ttl}}"/>
+        </filter>
+
+      </multicast>
+    </route>
+
+    <route id="second-step-filtering" startupOrder="2000">
+      <description>Second step filtering</description>
+
+      <from uri="{{msg.endpoint.prefix}}:second-step-filtering.withSocialNetwork?concurrentConsumers=5&amp;asyncConsumer=true"/>
+
+      <multicast>
+        <!-- Meetme in Granada -->
+        <filter>
+          <mvel>
+            <![CDATA[
+              request.headers.MessageType == 'meetme' &&
+              request.headers.City == 'Granada'
+             ]]>
+          </mvel>
+          <to uri="{{msg.endpoint.prefix}}:meetme.Granada?timeToLive={{msg.ttl}}"/>
+          <filter>
+            <!-- ... but also moves to other cities -->
+            <jsonpath>$.placesIveBeen[?(@.city != 'Granada')]</jsonpath>
+            <to uri="{{msg.endpoint.prefix}}:meetme.Granada.and.others?timeToLive={{msg.ttl}}"/>
+          </filter>
+        </filter>
+
+      </multicast>
+    </route>
+  </camelContext>
+
+  <!-- Local embedded broker -->
+  <bean id="embedded-connection" class="org.apache.activemq.camel.component.ActiveMQComponent">
+      <property name="connectionFactory">
+          <bean class="org.apache.activemq.ActiveMQConnectionFactory">
+              <property name="brokerURL" value="vm://localhost:61617?create=false"/>
+          </bean>
+      </property>
+  </bean>
+
+  <bean id="jmsConnectionFactory" class="org.apache.activemq.ActiveMQConnectionFactory">
+      <property name="brokerURL" value="tcp://localhost:61616"/>
+  </bean>
+
+  <!-- Setup Central AMQ JMS connection factory -->
+  <bean id="poolConnectionFactory" class="org.apache.activemq.pool.PooledConnectionFactory" init-method="start"
+        destroy-method="stop">
+      <property name="maxConnections" value="8"/>
+      <property name="connectionFactory" ref="jmsConnectionFactory"/>
+  </bean>
+
+  <!-- Central ActiveMQ broker -->
+  <bean id="activemq-central" class="org.apache.activemq.camel.component.ActiveMQComponent">
+      <property name="connectionFactory" ref="poolConnectionFactory"/>
+  </bean>
+
+  <!-- Spring JmsTemplate providing easy access to JMS browser with applied JMS selector -->
+  <bean id="centralActiveMQBrowser" class="org.springframework.jms.core.JmsTemplate">
+      <property name="connectionFactory" ref="poolConnectionFactory"/>
+  </bean>
+
+</beans>
